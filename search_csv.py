@@ -5,8 +5,9 @@ produced it, followed by the results themselves:
 
     [SciGlass Explorer Search],format=1
     [Constraints]
-    Table,Column,Operator,Value,OR Group,Tolerance
-    Elements,Si,>,0.1,,
+    Table,Column,Operator,Value,OR Group,Tolerance,Allow Missing
+    Elements,Si,>,0.1,,,
+    Property,Tg,>=,1000,,,Yes
     [Selected Elements]
     Si,O
     [Selected Compounds]
@@ -29,7 +30,7 @@ import pandas as pd
 
 FORMAT_VERSION = 1
 MAGIC = "[SciGlass Explorer Search]"
-CONSTRAINT_HEADER = ["Table", "Column", "Operator", "Value", "OR Group", "Tolerance"]
+CONSTRAINT_HEADER = ["Table", "Column", "Operator", "Value", "OR Group", "Tolerance", "Allow Missing"]
 
 SECTION_CONSTRAINTS = "[Constraints]"
 SECTION_ELEMENTS = "[Selected Elements]"
@@ -100,7 +101,7 @@ def read_search_csv(path: str) -> SearchSpec:
 
         cells = [c.strip() for c in row]
         if section == SECTION_CONSTRAINTS:
-            if not any(cells) or cells[: len(CONSTRAINT_HEADER)] == CONSTRAINT_HEADER:
+            if not any(cells) or cells[:2] == CONSTRAINT_HEADER[:2]:
                 continue
             cells = (cells + [""] * len(CONSTRAINT_HEADER))[: len(CONSTRAINT_HEADER)]
             spec.constraints.append(cells)

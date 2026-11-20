@@ -70,6 +70,41 @@ class ListWidget(QListWidget):
         # parent.addItem(self.grid)
 
 
+# Column in the constraints model holding the "Allow Missing" checkbox
+ALLOW_MISSING_COL = 6
+
+
+def make_constraint_items(values: List[str]) -> List[QStandardItem]:
+    """Build a constraints-model row. values[ALLOW_MISSING_COL] is truthy ("Yes") to check Allow Missing."""
+    values = (list(values) + [""] * (ALLOW_MISSING_COL + 1))[: ALLOW_MISSING_COL + 1]
+    items = []
+    for i, value in enumerate(values):
+        if i == ALLOW_MISSING_COL:
+            item = QStandardItem()
+            item.setCheckable(True)
+            item.setEditable(False)
+            checked = str(value).strip().lower() in ("yes", "true", "1", "y", "x")
+            item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        elif isinstance(value, float):
+            item = QStandardItem(f"{value:.10g}")
+        else:
+            item = QStandardItem(str(value))
+        items.append(item)
+    return items
+
+
+def constraint_row_values(model: QStandardItemModel, row: int) -> List[str]:
+    """Read a constraints-model row as strings; Allow Missing becomes "Yes" or ""."""
+    values = []
+    for col in range(model.columnCount()):
+        item = model.item(row, col)
+        if col == ALLOW_MISSING_COL:
+            values.append("Yes" if item is not None and item.checkState() == Qt.Checked else "")
+        else:
+            values.append(item.text() if item is not None else "")
+    return values
+
+
 class MainWindow(QWidget, Ui_MainWidget):
     def __init__(self):
         super().__init__()
@@ -123,7 +158,10 @@ class MainWindow(QWidget, Ui_MainWidget):
         # Constraint List Widget
         self.constraintsModel = QStandardItemModel()
         self.constraintsListWidget.setModel(self.constraintsModel)
-        self.constraintsModel.setHorizontalHeaderLabels(["", "", "", "", "OR Group", "Tolerance"])
+        self.constraintsModel.setHorizontalHeaderLabels(["", "", "", "", "OR Group", "Tolerance", "Allow Missing"])
+        self.constraintsModel.horizontalHeaderItem(ALLOW_MISSING_COL).setToolTip(
+            "When checked, materials with no data for this column are not excluded by this constraint."
+        )
 
         # Dropdown for table columns
         self.tableDropdown.currentTextChanged.connect(self.update_columns)
@@ -168,6 +206,7 @@ class MainWindow(QWidget, Ui_MainWidget):
             self.valueField.text(),
             "",
             "",
+            "",
         ]
 
     # setter for new_constraint
@@ -179,10 +218,7 @@ class MainWindow(QWidget, Ui_MainWidget):
         self.valueField.setText(str(new_constraint[3]))
 
     def current_search_spec(self) -> SearchSpec:
-        constraints = [
-            [self.constraintsModel.item(row, col).text() for col in range(self.constraintsModel.columnCount())]
-            for row in range(self.constraintsModel.rowCount())
-        ]
+        constraints = [constraint_row_values(self.constraintsModel, row) for row in range(self.constraintsModel.rowCount())]
         return SearchSpec(
             constraints=constraints,
             elements=[item.text() for item in self.elementsListWidget.selectedItems()],
@@ -258,7 +294,7 @@ class MainWindow(QWidget, Ui_MainWidget):
 
         self.constraintsModel.removeRows(0, self.constraintsModel.rowCount())
         for constraint in spec.constraints:
-            self.constraintsModel.appendRow([QStandardItem(value) for value in constraint])
+            self.constraintsModel.appendRow(make_constraint_items(constraint))
         self.constraintsListWidget.resizeColumnsToContents()
 
     def build_sql_query(self):
@@ -277,6 +313,8 @@ class MainWindow(QWidget, Ui_MainWidget):
             value = self.constraintsModel.item(row, 3).text()
             or_group = self.constraintsModel.item(row, 4).text()  # Assuming OR group number is in the fifth column
             tolerance = self.constraintsModel.item(row, 5).text()  # Assuming tolerance is in the sixth column
+            allow_missing_item = self.constraintsModel.item(row, ALLOW_MISSING_COL)
+            allow_missing = allow_missing_item is not None and allow_missing_item.checkState() == Qt.Checked
 
             # if operator is "=" and tolerance is not empty, change operator to BETWEEN, and add two conditions
             if operator == "=" and tolerance != "":
@@ -285,6 +323,11 @@ class MainWindow(QWidget, Ui_MainWidget):
                 condition = f"{table}.{column} {operator} {value}"
             else:
                 condition = f"{table}.{column} {operator} '{value}'"
+
+            # Missing data is stored as NULL or 0; optionally let those rows through this constraint
+            if allow_missing:
+                field = f"{table}.{column}"
+                condition = f"({condition} OR {field} IS NULL OR {field} = 0 OR {field} = '')"
 
             # Group the conditions or add to ungrouped
             if or_group != "":
@@ -335,11 +378,8 @@ class MainWindow(QWidget, Ui_MainWidget):
 
         # for each new constraint, add it to the constraintsModel
         for constraint in new_constraints:
-            # add a placeholder constraint to the constraintsModel
-            self.addConstraint()
-            # edit the constraint to match the values in the row, use a for loop through the constraint columns to avoid hardcoding the column numbers
-            for i in range(len(constraint)):
-                self.constraintsModel.item(self.constraintsModel.rowCount() - 1, i).setText(str(constraint[i]))
+            self.constraintsModel.appendRow(make_constraint_items(constraint))
+        self.constraintsListWidget.resizeColumnsToContents()
 
     def update_columns(self):
         self.selected_elements = [item.text() for item in self.elementsListWidget.selectedItems()]
@@ -443,14 +483,7 @@ class MainWindow(QWidget, Ui_MainWidget):
     # Function placeholders for button actions
     def addConstraint(self):
         # Logic to add constraint
-        row = []
-        for item in self.new_constraint:
-            if isinstance(item, (int, float)):
-                formatted_item = f"{item:.10g}"
-                row.append(QStandardItem(formatted_item))
-            else:
-                row.append(QStandardItem(str(item)))
-        self.constraintsModel.appendRow(row)
+        self.constraintsModel.appendRow(make_constraint_items(self.new_constraint))
         self.constraintsListWidget.resizeColumnsToContents()
 
     def removeConstraint(self):
