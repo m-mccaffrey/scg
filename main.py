@@ -1,5 +1,5 @@
 import sys
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QWidget, QListWidget, QPushButton, QGridLayout, QAbstractItemView, QLineEdit
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QLabel, QWidget, QListWidget, QPushButton, QGridLayout, QAbstractItemView, QLineEdit
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QIcon
 from ui_main import Ui_MainWidget
@@ -12,6 +12,8 @@ import sqlite3
 from PySide6.QtWidgets import QStyledItemDelegate
 from PySide6.QtGui import QColor
 import manifest
+import os
+import settings
 import pandas as pd
 from search_csv import SearchSpec, SearchCsvError, write_search_csv, read_search_csv
 
@@ -70,6 +72,27 @@ class ListWidget(QListWidget):
         # parent.addItem(self.grid)
 
 
+# Tables every searchable database must contain (joined on row_id in build_sql_query)
+REQUIRED_TABLES = ("compounds", "elements", "property", "metadata")
+
+
+def open_database(path: str) -> sqlite3.Connection:
+    """Open a SciGlass-format database, raising ValueError if it is missing or not in the expected format."""
+    if not os.path.isfile(path):
+        raise ValueError(f"Database file not found:\n{path}")
+    conn = sqlite3.connect(path)
+    try:
+        tables = {row[0].lower() for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    except sqlite3.DatabaseError as e:
+        conn.close()
+        raise ValueError(f"Not a valid SQLite database:\n{path}\n\n{e}")
+    missing = [t for t in REQUIRED_TABLES if t not in tables]
+    if missing:
+        conn.close()
+        raise ValueError(f"{os.path.basename(path)} is missing required table(s): {', '.join(missing)}")
+    return conn
+
+
 # Column in the constraints model holding the "Allow Missing" checkbox
 ALLOW_MISSING_COL = 6
 
@@ -122,7 +145,13 @@ class MainWindow(QWidget, Ui_MainWidget):
         self.setWindowIcon(QIcon(manifest.ICON_FILE_NAME))
 
         # Connect to SQLite database
-        self.conn = sqlite3.connect("SciGlass.db")
+        self.conn = None
+        self.db_path = None
+        self.dbLabel = QLabel(self)
+        self.chooseDbButton = QPushButton("Choose Database...", self)
+        self.chooseDbButton.clicked.connect(self.choose_database)
+        self.bottom_layout.addWidget(self.dbLabel, 2, 0, 1, 1, Qt.AlignRight | Qt.AlignVCenter)
+        self.bottom_layout.addWidget(self.chooseDbButton, 2, 1, 1, 1)
         # Set the window icon
         self.setWindowTitle(f"{manifest.APP_TITLE} Version {manifest.APP_VERSION} (Build {manifest.APP_BUILD})")
 
@@ -206,6 +235,9 @@ class MainWindow(QWidget, Ui_MainWidget):
 
         # import search from csv button
         self.btnImport.clicked.connect(self.import_from_csv)
+
+        # open the saved database (or SciGlass.db by default)
+        self.set_database(settings.get_database_path(), save=False)
 
     @property
     def new_constraint(self):
@@ -436,6 +468,10 @@ class MainWindow(QWidget, Ui_MainWidget):
         self.selected_properties = [item.text() for item in self.propertiesListWidget.selectedItems()]
         self.unselected_properties = [p for p in self.properties if p not in self.selected_properties]
 
+        if self.conn is None:
+            QMessageBox.warning(self, "Fetch Data", "No database is open. Use Choose Database... to select one.")
+            return
+
         # Build and execute the SQL query
         sql_query = self.build_sql_query()
         cursor = self.conn.cursor()
@@ -551,9 +587,50 @@ class MainWindow(QWidget, Ui_MainWidget):
                 row.append(QStandardItem(str(item)))
         self.model.appendRow(row)
 
+    def set_database(self, path: str, save: bool = True) -> bool:
+        """Switch the searched database. Returns False (keeping the current one) if it can't be opened."""
+        try:
+            new_conn = open_database(path)
+        except ValueError as e:
+            if self.conn is None:
+                self.dbLabel.setText("Database: (none)")
+                self.dbLabel.setToolTip("")
+            QMessageBox.warning(self, "Choose Database", str(e))
+            return False
+
+        if self.conn is not None:
+            self.conn.close()
+        self.conn = new_conn
+        self.db_path = os.path.abspath(path)
+        self.dbLabel.setText(f"Database: {os.path.basename(self.db_path)}")
+        self.dbLabel.setToolTip(self.db_path)
+
+        # results from the previous database no longer apply
+        self.df = None
+        self.last_search_spec = None
+        self.currentPage = 0
+        self.model.clear()
+        self.totalResultsLabel.setText("")
+
+        if save:
+            try:
+                settings.set_database_path(self.db_path)
+            except OSError as e:
+                QMessageBox.warning(self, "Choose Database", f"Database opened, but the selection could not be saved:\n{e}")
+        return True
+
+    def choose_database(self):
+        start_dir = os.path.dirname(self.db_path) if self.db_path else settings.APP_DIR
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "Choose Database", start_dir, "SQLite Databases (*.db *.sqlite *.sqlite3);;All Files (*)"
+        )
+        if filename:
+            self.set_database(filename)
+
     def __del__(self):
         # Close the database connection when the window is closed
-        self.conn.close()
+        if self.conn is not None:
+            self.conn.close()
 
 
 class SciGlassExplorer(QApplication):

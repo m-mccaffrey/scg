@@ -1,6 +1,8 @@
 
 convert.py
-SciGlass.db
+*.db
+settings.json
+settings.json.tmp
 build/main/xref-main.html
 build/main/warn-main.txt
 build/main/PYZ-00.toc
