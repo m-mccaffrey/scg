@@ -1,5 +1,5 @@
 import sys
-from PySide6.QtWidgets import QApplication, QFileDialog, QWidget, QListWidget, QPushButton, QGridLayout, QAbstractItemView, QLineEdit
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QWidget, QListWidget, QPushButton, QGridLayout, QAbstractItemView, QLineEdit
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QIcon
 from ui_main import Ui_MainWidget
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QStyledItemDelegate
 from PySide6.QtGui import QColor
 import manifest
 import pandas as pd
+from search_csv import SearchSpec, SearchCsvError, write_search_csv, read_search_csv
 
 
 class HighlightColumnDelegate(QStyledItemDelegate):
@@ -155,6 +156,9 @@ class MainWindow(QWidget, Ui_MainWidget):
         # export to csv button
         self.export_button.clicked.connect(self.export_to_csv)
 
+        # import search from csv button
+        self.btnImport.clicked.connect(self.import_from_csv)
+
     @property
     def new_constraint(self):
         return [
@@ -174,24 +178,88 @@ class MainWindow(QWidget, Ui_MainWidget):
         self.comparisonDropdown.setCurrentText(new_constraint[2])
         self.valueField.setText(str(new_constraint[3]))
 
+    def current_search_spec(self) -> SearchSpec:
+        constraints = [
+            [self.constraintsModel.item(row, col).text() for col in range(self.constraintsModel.columnCount())]
+            for row in range(self.constraintsModel.rowCount())
+        ]
+        return SearchSpec(
+            constraints=constraints,
+            elements=[item.text() for item in self.elementsListWidget.selectedItems()],
+            compounds=[item.text() for item in self.compoundsListWidget.selectedItems()],
+            properties=[item.text() for item in self.propertiesListWidget.selectedItems()],
+        )
+
     def export_to_csv(self):
+        df = getattr(self, "df", None)
+        if df is None:
+            QMessageBox.information(self, "Export to CSV", "Fetch data before exporting.")
+            return
+
         # create a temporary copy of the dataframe to avoid modifying the original
-        df_copy = self.df.copy()
+        df_copy = df.copy()
         # remove table names from column headers
         df_copy.columns = [col.split("_")[1] for col in df_copy.columns]
         # remove duplicate columns
         df_copy = df_copy.loc[:, ~df_copy.columns.duplicated()]
 
-        # dialog to get the filename
-        file_dialog = QFileDialog()
-        file_dialog.setAcceptMode(QFileDialog.AcceptSave)
-        file_dialog.setNameFilter("CSV Files (*.csv)")
-        file_dialog.setDefaultSuffix("csv")
-        file_dialog.setModal(True)
-        file_dialog.exec_()
-        filename = file_dialog.selectedFiles()[0]
-        if filename:
-            df_copy.to_csv(filename, index=False)
+        filename, _ = QFileDialog.getSaveFileName(self, "Export to CSV", "", "CSV Files (*.csv)")
+        if not filename:
+            return
+        if not filename.lower().endswith(".csv"):
+            filename += ".csv"
+
+        # save the constraints used for this search (as of the last fetch) ahead of the results
+        spec = getattr(self, "last_search_spec", None) or self.current_search_spec()
+        try:
+            write_search_csv(filename, spec, df_copy)
+        except OSError as e:
+            QMessageBox.critical(self, "Export to CSV", f"Could not write {filename}:\n{e}")
+
+    def import_from_csv(self):
+        filename, _ = QFileDialog.getOpenFileName(self, "Import Search From CSV", "", "CSV Files (*.csv);;All Files (*)")
+        if not filename:
+            return
+        try:
+            spec = read_search_csv(filename)
+        except (SearchCsvError, OSError, UnicodeDecodeError) as e:
+            QMessageBox.warning(self, "Import From CSV", str(e))
+            return
+
+        self.apply_search_spec(spec)
+
+        if spec.constraints:
+            self.currentPage = 0
+            try:
+                self.fetchData()
+            except Exception as e:
+                QMessageBox.warning(self, "Import From CSV", f"Search restored, but fetching data failed:\n{e}")
+
+    def apply_search_spec(self, spec: SearchSpec):
+        # clear the search boxes so every list item is available to be selected
+        for line in (self.lineElementSearch, self.lineCompoundSearch, self.linePropertySearch):
+            line.clear()
+
+        def select_items(widget: QListWidget, wanted: List[str], handler: Callable):
+            wanted = set(wanted)
+            widget.blockSignals(True)
+            widget.clearSelection()
+            for i in range(widget.count()):
+                item = widget.item(i)
+                if item.text() in wanted:
+                    item.setSelected(True)
+            widget.blockSignals(False)
+            handler()
+
+        # elements first: selecting elements repopulates the compounds list
+        select_items(self.elementsListWidget, spec.elements, self.element_list_handler)
+        select_items(self.compoundsListWidget, spec.compounds, self.compound_list_handler)
+        select_items(self.propertiesListWidget, spec.properties, self.property_list_handler)
+
+        self.constraintsModel.removeRows(0, self.constraintsModel.rowCount())
+        for constraint in spec.constraints:
+            self.constraintsModel.appendRow([QStandardItem(value) for value in constraint])
+        self.constraintsListWidget.resizeColumnsToContents()
 
     def build_sql_query(self):
         or_groups = {}
@@ -308,22 +376,19 @@ class MainWindow(QWidget, Ui_MainWidget):
 
     def fetchData(self):
         self.selected_compounds = [item.text() for item in self.compoundsListWidget.selectedItems()]
-        self.unselected_compounds = self.compounds
+        self.unselected_compounds = [c for c in self.compounds if c not in self.selected_compounds]
 
         self.selected_properties = [item.text() for item in self.propertiesListWidget.selectedItems()]
-        self.unselected_properties = self.properties
-
-        try:
-            [self.unselected_compounds.remove(c) for c in self.selected_compounds]
-            [self.unselected_properties.remove(c) for c in self.selected_properties]
-        except:
-            pass
+        self.unselected_properties = [p for p in self.properties if p not in self.selected_properties]
 
         # Build and execute the SQL query
         sql_query = self.build_sql_query()
         cursor = self.conn.cursor()
         cursor.execute(sql_query)
         query_results = cursor.fetchall()
+
+        # remember the search that produced these results, for export
+        self.last_search_spec = self.current_search_spec()
 
         # Get the total number of results
         self.totalResultsLabel.setText(f"Total Results: {len(query_results)}")
