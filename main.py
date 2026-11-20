@@ -74,17 +74,26 @@ class ListWidget(QListWidget):
 ALLOW_MISSING_COL = 6
 
 
+def allows_missing_option(table: str) -> bool:
+    """Only properties can have unknown values; a 0 in a composition column means "not present"."""
+    return str(table).strip().lower() == "property"
+
+
 def make_constraint_items(values: List[str]) -> List[QStandardItem]:
-    """Build a constraints-model row. values[ALLOW_MISSING_COL] is truthy ("Yes") to check Allow Missing."""
+    """Build a constraints-model row. values[ALLOW_MISSING_COL] is truthy ("Yes") to check Allow Missing,
+    which is only offered on Property constraints."""
     values = (list(values) + [""] * (ALLOW_MISSING_COL + 1))[: ALLOW_MISSING_COL + 1]
     items = []
     for i, value in enumerate(values):
         if i == ALLOW_MISSING_COL:
             item = QStandardItem()
-            item.setCheckable(True)
             item.setEditable(False)
-            checked = str(value).strip().lower() in ("yes", "true", "1", "y", "x")
-            item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+            if allows_missing_option(values[0]):
+                item.setCheckable(True)
+                checked = str(value).strip().lower() in ("yes", "true", "1", "y", "x")
+                item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+            else:
+                item.setEnabled(False)
         elif isinstance(value, float):
             item = QStandardItem(f"{value:.10g}")
         else:
@@ -99,7 +108,8 @@ def constraint_row_values(model: QStandardItemModel, row: int) -> List[str]:
     for col in range(model.columnCount()):
         item = model.item(row, col)
         if col == ALLOW_MISSING_COL:
-            values.append("Yes" if item is not None and item.checkState() == Qt.Checked else "")
+            checked = item is not None and item.isCheckable() and item.checkState() == Qt.Checked
+            values.append("Yes" if checked and allows_missing_option(values[0]) else "")
         else:
             values.append(item.text() if item is not None else "")
     return values
@@ -160,7 +170,7 @@ class MainWindow(QWidget, Ui_MainWidget):
         self.constraintsListWidget.setModel(self.constraintsModel)
         self.constraintsModel.setHorizontalHeaderLabels(["", "", "", "", "OR Group", "Tolerance", "Allow Missing"])
         self.constraintsModel.horizontalHeaderItem(ALLOW_MISSING_COL).setToolTip(
-            "When checked, materials with no data for this column are not excluded by this constraint."
+            "Property constraints only: when checked, materials with no data for this property are not excluded by this constraint."
         )
 
         # Dropdown for table columns
@@ -314,7 +324,12 @@ class MainWindow(QWidget, Ui_MainWidget):
             or_group = self.constraintsModel.item(row, 4).text()  # Assuming OR group number is in the fifth column
             tolerance = self.constraintsModel.item(row, 5).text()  # Assuming tolerance is in the sixth column
             allow_missing_item = self.constraintsModel.item(row, ALLOW_MISSING_COL)
-            allow_missing = allow_missing_item is not None and allow_missing_item.checkState() == Qt.Checked
+            allow_missing = (
+                allows_missing_option(table)
+                and allow_missing_item is not None
+                and allow_missing_item.isCheckable()
+                and allow_missing_item.checkState() == Qt.Checked
+            )
 
             # if operator is "=" and tolerance is not empty, change operator to BETWEEN, and add two conditions
             if operator == "=" and tolerance != "":
