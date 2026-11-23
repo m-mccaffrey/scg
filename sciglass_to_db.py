@@ -11,7 +11,8 @@ Two databases are written to OUT_DIR (default: SCIGLASS_DIR):
 
 Both have elements in atomic %, the same properties and the same metadata, in the layout main.py
 queries (see xlsx_to_db.py): elements / compounds / property / metadata tables joined on row_id,
-plus db_info with the composition basis and property units.
+plus db_info with the composition basis and property units. metadata_NumberCompounds counts each
+glass's compounds above 0 in that database's basis (see db_tools.py).
 
 Sources
     select/SciGK     one row per glass: properties, author, year, glass class (KOD, GLASNO identify it)
@@ -49,6 +50,9 @@ import sys
 from collections import Counter, defaultdict
 
 import pandas as pd
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # db_tools.py sits alongside
+from db_tools import add_number_compounds, check_number_compounds
 
 # (SciGK column, database name, unit, scale, offset): stored = source * scale + offset
 PROPERTIES = (
@@ -285,6 +289,7 @@ def write_db(path, basis, rows, assigned, el_names, refs, compounds):
             conn.executemany(sql, ([gid] + values(row, comp if (idx == 0 or not comp or next(iter(comp.values()))[1] is not None) else {}, atoms)
                                    for row, (gid, comp, atoms) in batch))
         conn.commit()
+    add_number_compounds(conn)
     conn.execute("CREATE TABLE db_info (key TEXT PRIMARY KEY, value TEXT)")
     info = [("composition_basis", BASES[basis]), ("zero_is_missing", "no"), ("source", "SciGlass (raw table export), converted by sciglass_to_db.py")]
     info += [(f"unit:{name}", unit) for _, name, unit, _, _ in PROPERTIES]
@@ -337,6 +342,9 @@ def verify(path, basis, base) -> bool:
     check("property", props)
     check("compounds", compounds)
     check("elements", lambda row, comp, atoms: atoms)
+    nc = check_number_compounds(conn)
+    print(f"  NumberCompounds: {'OK' if not nc else f'{len(nc)} problems'}")
+    problems += nc
     conn.close()
 
     for p in problems[:30]:

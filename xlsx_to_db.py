@@ -21,6 +21,7 @@ Database layout (what main.py queries):
     property(row_id, property_<name>, ...)
     metadata(row_id, metadata_<name>, ...)
 
+    metadata_NumberCompounds   compounds above 0 per glass (added unless the spreadsheet has its own)
     db_info(key, value)   notes shown by the app: "composition_basis" and one "unit:<property>" per property
 
 Column names are kept exactly as in the spreadsheet. Blank cells become NULL. Element, compound
@@ -42,6 +43,9 @@ import sqlite3
 import sys
 
 import openpyxl
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # db_tools.py sits alongside
+from db_tools import COLUMN as NUMBER_COMPOUNDS, add_number_compounds, check_number_compounds
 
 ELEMENT_SYMBOLS = {
     "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne", "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar", "K", "Ca",
@@ -246,6 +250,8 @@ def convert(xlsx_path: str, db_path: str, sheet: str, first_property: str, first
             placeholders = ", ".join("?" * (len(idxs) + 1))
             conn.executemany(f"INSERT INTO {table} VALUES ({placeholders})", data)
         conn.commit()
+        if NUMBER_COMPOUNDS not in [f"metadata_{names[i]}" for i in groups["metadata"]]:
+            add_number_compounds(conn)
     finally:
         conn.close()
     os.replace(tmp_path, db_path)
@@ -277,6 +283,8 @@ def verify(xlsx_path: str, db_path: str, sheet: str, first_property: str, first_
         for table, idxs in groups.items():
             db_cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
             expected = ["row_id"] + [f"{table}_{names[i]}" for i in idxs]
+            if table == "metadata" and NUMBER_COMPOUNDS not in expected:
+                expected.append(NUMBER_COMPOUNDS)  # derived column, checked below
             if db_cols != expected:
                 problems.append(f"{table}: columns differ from the spreadsheet")
                 continue
@@ -292,6 +300,8 @@ def verify(xlsx_path: str, db_path: str, sheet: str, first_property: str, first_
                     cells += 1
                     if not same(r[i], stored[k]):
                         problems.append(f"{table}: ID {r[0]}, column {names[i]}: spreadsheet {r[i]!r}, database {stored[k]!r}")
+        if NUMBER_COMPOUNDS not in [f"metadata_{names[i]}" for i in groups["metadata"]]:
+            problems += check_number_compounds(conn)
     finally:
         conn.close()
 
