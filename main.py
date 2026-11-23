@@ -89,6 +89,14 @@ def open_database(path: str) -> sqlite3.Connection:
     return conn
 
 
+# The four tables, joined on row_id
+JOIN_CLAUSE = """
+    compounds
+    JOIN elements ON compounds.row_id = elements.row_id
+    JOIN property ON compounds.row_id = property.row_id
+    JOIN metadata ON compounds.row_id = metadata.row_id
+"""
+
 # Constraint-builder table names for each database table
 TABLE_LABELS = {"elements": "Elements", "compounds": "Compounds", "property": "Property", "metadata": "Metadata"}
 
@@ -238,6 +246,8 @@ class MainWindow(QWidget, Ui_MainWidget):
         self.metadata_columns: List[str] = []
         self.units: dict = {}
         self.composition_basis = ""
+        # whether a 0 in a property/metadata column means "no data" (compositions: 0 always means absent)
+        self.zero_is_missing = True
 
         # note under the results saying what the composition numbers mean
         self.compositionLabel = QLabel(self)
@@ -424,6 +434,10 @@ class MainWindow(QWidget, Ui_MainWidget):
         self.constraintsListWidget.resizeColumnsToContents()
 
     def build_sql_query(self):
+        where_clause = self.build_where_clause()
+        return f"SELECT * FROM {JOIN_CLAUSE}" + (f" WHERE {where_clause}" if where_clause else "")
+
+    def build_where_clause(self) -> str:
         or_groups = {}
         ungrouped_clauses = []
 
@@ -457,9 +471,13 @@ class MainWindow(QWidget, Ui_MainWidget):
                 escaped = value.replace("'", "''")
                 condition = f"{field} {operator} '{escaped}'"
 
-            # Missing data is stored as NULL or 0; optionally let those rows through this constraint
+            # Missing data is NULL (or 0, in databases that store missing values as 0);
+            # optionally let those rows through this constraint
             if allow_missing:
-                condition = f"({condition} OR {field} IS NULL OR {field} = 0 OR {field} = '')"
+                if self.zero_is_missing:
+                    condition = f"({condition} OR {field} IS NULL OR {field} = 0 OR {field} = '')"
+                else:
+                    condition = f"({condition} OR {field} IS NULL)"
 
             # Group the conditions or add to ungrouped
             if or_group != "":
@@ -470,19 +488,45 @@ class MainWindow(QWidget, Ui_MainWidget):
         # Build WHERE clause with OR conditions within groups and AND between groups
         grouped_where_clause = " AND ".join([f"({' OR '.join(conditions)})" for conditions in or_groups.values()])
         ungrouped_where_clause = " AND ".join(ungrouped_clauses)
-        where_clause = " AND ".join(filter(None, [grouped_where_clause, ungrouped_where_clause]))
+        return " AND ".join(filter(None, [grouped_where_clause, ungrouped_where_clause]))
 
-        # Build the JOIN part of the query
-        join_clause = """
-            compounds
-            JOIN elements ON compounds.row_id = elements.row_id
-            JOIN property ON compounds.row_id = property.row_id
-            JOIN metadata ON compounds.row_id = metadata.row_id
-        """
+    def run_search(self):
+        """Run the constraints and return (column names, rows) for the matching glasses, fetching only
+        columns that have data for at least one match (plus the constrained columns). Large databases
+        have hundreds of mostly empty columns, so this keeps broad searches fast."""
+        where_clause = self.build_where_clause()
+        cur = self.conn.cursor()
+        cur.execute("DROP TABLE IF EXISTS temp.matches")
+        cur.execute("CREATE TEMP TABLE matches (row_id, n INTEGER PRIMARY KEY)")
+        cur.execute(
+            f"INSERT INTO temp.matches (row_id) SELECT compounds.row_id FROM {JOIN_CLAUSE}"
+            + (f" WHERE {where_clause}" if where_clause else "")
+            + " ORDER BY compounds.rowid"
+        )
+        cur.execute("CREATE INDEX temp.matches_row_id ON matches (row_id)")
 
-        # Combine everything to form the final query
-        query = f"SELECT * FROM {join_clause}" + (f" WHERE {where_clause}" if where_clause else "")
-        return query
+        constrained = set(self.constrained_db_columns())
+        selected = []
+        for table in REQUIRED_TABLES:
+            columns = [r[1] for r in cur.execute(f"PRAGMA table_info({quote_identifier(table)})") if r[1] != "row_id"]
+            if not columns:
+                continue
+            zero_empty = table in ("elements", "compounds") or self.zero_is_missing
+            counts = cur.execute(
+                "SELECT "
+                + ", ".join(f"count(NULLIF({quote_identifier(c)}, 0))" if zero_empty else f"count({quote_identifier(c)})" for c in columns)
+                + f" FROM {quote_identifier(table)} JOIN temp.matches m ON {quote_identifier(table)}.row_id = m.row_id"
+            ).fetchone()
+            selected += [f"{quote_identifier(table)}.{quote_identifier(c)}" for c, n in zip(columns, counts) if n or c in constrained]
+
+        cur.execute(
+            "SELECT m.row_id" + "".join(f", {c}" for c in selected)
+            + " FROM temp.matches m"
+            + "".join(f" JOIN {quote_identifier(t)} ON {quote_identifier(t)}.row_id = m.row_id" for t in REQUIRED_TABLES)
+            + " ORDER BY m.n"
+        )
+        rows = cur.fetchall()
+        return [d[0] for d in cur.description], rows
 
     # For the selected cells in the tableView, create a new constraint for each of the nonzero (and not nan) values and add it to the constraintsModel
     # This is achieved by adding a constraint regardless of the values in the dropdowns and field, and then editing the constraint to match the values in the row
@@ -598,10 +642,7 @@ class MainWindow(QWidget, Ui_MainWidget):
 
         # Build and execute the SQL query
         try:
-            sql_query = self.build_sql_query()
-            cursor = self.conn.cursor()
-            cursor.execute(sql_query)
-            query_results = cursor.fetchall()
+            column_names, query_results = self.run_search()
         except (sqlite3.Error, ValueError) as e:
             QMessageBox.warning(
                 self, "Fetch Data", f"The search could not be run. Check that every constraint refers to a column in this database.\n\n{e}"
@@ -614,17 +655,19 @@ class MainWindow(QWidget, Ui_MainWidget):
         # Get the total number of results
         self.totalResultsLabel.setText(f"Total Results: {len(query_results)}")
 
-        # Assuming you have column names for the DataFrame (adjust as necessary)
-        column_names = [description[0] for description in cursor.description]
-
         # Create the DataFrame
         self.df = pd.DataFrame(query_results, columns=column_names)
 
         # every table has a row_id; keep just one
         self.df = self.df.loc[:, ~self.df.columns.duplicated()]
 
-        # Replace 0 with pd.NA
-        self.df.replace(0, nan, inplace=True)
+        # A 0 composition means the component is absent: show it blank. In older databases a 0 property
+        # also means "no data"; where the database says 0 is a real value, it is kept.
+        zero_cols = [
+            col for col in self.df.columns
+            if col.startswith(("elements_", "compounds_")) or (self.zero_is_missing and col != "row_id")
+        ]
+        self.df[zero_cols] = self.df[zero_cols].replace(0, nan)
 
         # Drop columns where all values are NA, except constrained ones (shown even when empty)
         constrained = self.constrained_db_columns()
@@ -772,6 +815,7 @@ class MainWindow(QWidget, Ui_MainWidget):
         info = read_database_info(self.conn)
         self.units = {key[len("unit:"):]: value for key, value in info.items() if key.startswith("unit:") and value}
         self.composition_basis = info.get("composition_basis", "")
+        self.zero_is_missing = info.get("zero_is_missing", "yes").strip().lower() != "no"
         notes = [f"Compositions: {self.composition_basis}" if self.composition_basis else "Composition basis: not recorded in this database"]
         if not self.units:
             notes.append("Property units: not recorded in this database")
