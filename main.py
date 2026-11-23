@@ -1,5 +1,5 @@
 import sys
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QLabel, QWidget, QListWidget, QPushButton, QGridLayout, QAbstractItemView, QLineEdit
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QLabel, QWidget, QListWidget, QListWidgetItem, QPushButton, QGridLayout, QAbstractItemView, QLineEdit
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QIcon
 from ui_main import Ui_MainWidget
@@ -15,6 +15,7 @@ import manifest
 import os
 import settings
 import pandas as pd
+from chemistry import group_elements, to_subscript
 from search_csv import SearchSpec, SearchCsvError, write_search_csv, read_search_csv
 
 
@@ -41,11 +42,6 @@ def filter_compounds_by_elements(compounds: List[str], elements: List[str]) -> L
     filtered_compounds = [compound for compound in compounds if any(element in re.findall(compound_pattern, compound) for element in elements)]
 
     return filtered_compounds
-
-
-def to_subscript(compound):
-    subscript_map = str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
-    return compound.translate(subscript_map)
 
 
 class ListWidget(QListWidget):
@@ -112,15 +108,65 @@ def read_database_columns(conn: sqlite3.Connection) -> dict:
     return columns
 
 
-def display_column_names(columns: List[str]) -> List[str]:
-    """Result-column headings: the name without its table prefix ("id" for row_id).
-    A name found in more than one table gets its table added, e.g. "Si (Compounds)"."""
-    base = ["id" if col == "row_id" else col.split("_", 1)[1] for col in columns]
-    counts = Counter(base)
-    return [
-        f"{name} ({TABLE_LABELS.get(col.split('_', 1)[0], col.split('_', 1)[0])})" if counts[name] > 1 and col != "row_id" else name
-        for name, col in zip(base, columns)
-    ]
+def read_database_info(conn: sqlite3.Connection) -> dict:
+    """Optional key/value notes stored by xlsx_to_db.py (composition basis, "unit:<property>" entries)."""
+    try:
+        return {str(k): str(v) for k, v in conn.execute("SELECT key, value FROM db_info")}
+    except sqlite3.Error:
+        return {}
+
+
+def display_column_names(columns: List[str], label: Callable[[str, str], str] = lambda table, name: name) -> List[str]:
+    """Result-column headings from "<table>_<name>" database columns ("id" for row_id).
+    label(table, name) formats each heading; a name found in more than one table gets its table added,
+    e.g. "Si [Compounds]"."""
+    parts = [("metadata", "id") if col == "row_id" else tuple(col.split("_", 1)) for col in columns]
+    counts = Counter(name for _, name in parts)
+    headings = []
+    for (table, name), col in zip(parts, columns):
+        text = "id" if col == "row_id" else label(table, name)
+        if col != "row_id" and counts[name] > 1:
+            text += f" [{TABLE_LABELS.get(table, table)}]"
+        headings.append(text)
+    return headings
+
+
+def order_result_columns(columns: List[str], constrained: List[str]) -> List[str]:
+    """Move the constrained columns (in constraint order) together, just left of the property columns.
+    row_id stays first."""
+    stacked = [c for c in constrained if c in columns and c != "row_id"]
+    rest = [c for c in columns if c not in stacked]
+    insert_at = next(
+        (i for i, c in enumerate(rest) if c.startswith("property_")),
+        next((i for i, c in enumerate(rest) if c.startswith("metadata_")), len(rest)),
+    )
+    return rest[:insert_at] + stacked + rest[insert_at:]
+
+
+# Item data role holding a list item's real (database) name; the visible text may be formatted
+NAME_ROLE = Qt.UserRole
+
+
+def item_name(item: QListWidgetItem) -> str:
+    return item.data(NAME_ROLE)
+
+
+def selected_names(widget: QListWidget) -> List[str]:
+    return [item_name(item) for item in widget.selectedItems() if item_name(item) is not None]
+
+
+class ConstraintColumnDelegate(QStyledItemDelegate):
+    """Shows the constraint's column with subscripts/units; the stored text stays the database name."""
+
+    def __init__(self, label: Callable[[str, str], str], parent=None):
+        super().__init__(parent)
+        self.label = label
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        table = str(index.siblingAtColumn(0).data() or "").lower()
+        if option.text and option.text != "id":
+            option.text = self.label(table, option.text)
 
 
 # Column in the constraints model holding the "Allow Missing" checkbox
@@ -185,11 +231,18 @@ class MainWindow(QWidget, Ui_MainWidget):
         # Set the window icon
         self.setWindowTitle(f"{manifest.APP_TITLE} Version {manifest.APP_VERSION} (Build {manifest.APP_BUILD})")
 
-        # Column lists come from the open database (see load_database_columns)
+        # Column lists, units and composition basis come from the open database (see load_database_columns)
         self.elements: List[str] = []
         self.compounds: List[str] = []
         self.properties: List[str] = []
         self.metadata_columns: List[str] = []
+        self.units: dict = {}
+        self.composition_basis = ""
+
+        # note under the results saying what the composition numbers mean
+        self.compositionLabel = QLabel(self)
+        self.compositionLabel.setWordWrap(True)
+        self.layout.addWidget(self.compositionLabel)
 
         def setup_list_widget(
             widget: QListWidget, get_items: Callable[[], List[str]], handler: Callable, btn_all: QPushButton, btn_none: QPushButton, line_search: QLineEdit
@@ -199,14 +252,11 @@ class MainWindow(QWidget, Ui_MainWidget):
             btn_none.clicked.connect(widget.clearSelection)
 
             def filter_list():
-                selected = list([item.text() for item in widget.selectedItems()])
-                query = line_search.text()
-                filtered = list([item for item in get_items() if query.lower() in item.lower()])
-                widget.clear()
-                new_items = list(set(filtered + selected))
-                widget.addItems(list(set(filtered + selected)))
-                [widget.item(new_items.index(item)).setSelected(True) for item in new_items if item in selected]
-                # widget.addItems(list([s for s in selected if s not in widget.items()]) )
+                # show matching items plus anything already selected, keeping the selection
+                selected = selected_names(widget)
+                query = line_search.text().lower()
+                names = [name for name in get_items() if query in name.lower() or name in selected]
+                self.fill_list(widget, names, selected)
 
             line_search.textChanged.connect(filter_list)
 
@@ -232,6 +282,8 @@ class MainWindow(QWidget, Ui_MainWidget):
         self.constraintsModel.horizontalHeaderItem(ALLOW_MISSING_COL).setToolTip(
             "Property constraints only: when checked, materials with no data for this property are not excluded by this constraint."
         )
+        self.constraintColumnDelegate = ConstraintColumnDelegate(self.column_label, self.constraintsListWidget)
+        self.constraintsListWidget.setItemDelegateForColumn(1, self.constraintColumnDelegate)
 
         # Dropdown for table columns
         self.tableDropdown.currentTextChanged.connect(self.update_columns)
@@ -274,7 +326,7 @@ class MainWindow(QWidget, Ui_MainWidget):
     def new_constraint(self):
         return [
             self.tableDropdown.currentText(),
-            self.columnDropdown.currentText(),
+            self.columnDropdown.currentData() or "",
             self.comparisonDropdown.currentText(),
             self.valueField.text(),
             "",
@@ -286,7 +338,7 @@ class MainWindow(QWidget, Ui_MainWidget):
     @new_constraint.setter
     def new_constraint(self, new_constraint):
         self.tableDropdown.setCurrentText(new_constraint[0])
-        self.columnDropdown.setCurrentText(new_constraint[1])
+        self.columnDropdown.setCurrentIndex(self.columnDropdown.findData(new_constraint[1]))
         self.comparisonDropdown.setCurrentText(new_constraint[2])
         self.valueField.setText(str(new_constraint[3]))
 
@@ -294,9 +346,9 @@ class MainWindow(QWidget, Ui_MainWidget):
         constraints = [constraint_row_values(self.constraintsModel, row) for row in range(self.constraintsModel.rowCount())]
         return SearchSpec(
             constraints=constraints,
-            elements=[item.text() for item in self.elementsListWidget.selectedItems()],
-            compounds=[item.text() for item in self.compoundsListWidget.selectedItems()],
-            properties=[item.text() for item in self.propertiesListWidget.selectedItems()],
+            elements=selected_names(self.elementsListWidget),
+            compounds=selected_names(self.compoundsListWidget),
+            properties=selected_names(self.propertiesListWidget),
         )
 
     def export_to_csv(self):
@@ -307,8 +359,10 @@ class MainWindow(QWidget, Ui_MainWidget):
 
         # create a temporary copy of the dataframe to avoid modifying the original
         df_copy = df.copy()
-        # remove table names from column headers
-        df_copy.columns = display_column_names(list(df_copy.columns))
+        # remove table names from column headers; add units (plain text formulas, for spreadsheets)
+        df_copy.columns = display_column_names(
+            list(df_copy.columns), lambda table, name: self.column_label(table, name, subscripts=False)
+        )
 
         filename, _ = QFileDialog.getSaveFileName(self, "Export to CSV", "", "CSV Files (*.csv)")
         if not filename:
@@ -319,7 +373,8 @@ class MainWindow(QWidget, Ui_MainWidget):
         # save the constraints used for this search (as of the last fetch) ahead of the results
         spec = getattr(self, "last_search_spec", None) or self.current_search_spec()
         try:
-            write_search_csv(filename, spec, df_copy)
+            database = {"File": os.path.basename(self.db_path or ""), "Compositions": self.composition_basis or "not recorded"}
+            write_search_csv(filename, spec, df_copy, database)
         except OSError as e:
             QMessageBox.critical(self, "Export to CSV", f"Could not write {filename}:\n{e}")
 
@@ -353,7 +408,7 @@ class MainWindow(QWidget, Ui_MainWidget):
             widget.clearSelection()
             for i in range(widget.count()):
                 item = widget.item(i)
-                if item.text() in wanted:
+                if item_name(item) in wanted:
                     item.setSelected(True)
             widget.blockSignals(False)
             handler()
@@ -460,43 +515,81 @@ class MainWindow(QWidget, Ui_MainWidget):
             self.constraintsModel.appendRow(make_constraint_items(constraint))
         self.constraintsListWidget.resizeColumnsToContents()
 
+    def column_label(self, table: str, name: str, subscripts: bool = True, units: bool = True) -> str:
+        """How a column is shown to the user: compound formulas with subscripts, properties with their unit."""
+        table = table.lower()
+        text = to_subscript(name) if subscripts and table == "compounds" else name
+        unit = self.units.get(name) if units and table == "property" else None
+        return f"{text} ({unit})" if unit else text
+
+    def fill_list(self, widget: QListWidget, names: List[str], selected=()):
+        """Rebuild a selection list. Elements are grouped under headings, compounds shown with subscripts,
+        properties with their unit as a tooltip. Each item keeps its database name in NAME_ROLE."""
+        selected = set(selected)
+        grouped = widget is self.elementsListWidget
+        if grouped:
+            sections = group_elements(list(names))
+        else:
+            sections = {None: list(names)}
+        table = "compounds" if widget is self.compoundsListWidget else ""
+
+        widget.blockSignals(True)
+        widget.clear()
+        for heading, members in sections.items():
+            if heading is not None:
+                header = QListWidgetItem(heading)
+                header.setFlags(Qt.ItemIsEnabled)  # visible, not selectable
+                font = header.font()
+                font.setBold(True)
+                header.setFont(font)
+                widget.addItem(header)
+            for name in members:
+                text = self.column_label(table, name, units=False)
+                item = QListWidgetItem(f"    {text}" if grouped else text)
+                item.setData(NAME_ROLE, name)
+                if widget is self.propertiesListWidget and self.units.get(name):
+                    item.setToolTip(f"Unit: {self.units[name]}")
+                widget.addItem(item)
+                if name in selected:
+                    item.setSelected(True)
+        widget.blockSignals(False)
+
     def update_columns(self):
-        self.selected_elements = [item.text() for item in self.elementsListWidget.selectedItems()]
-        self.selected_compounds = [item.text() for item in self.compoundsListWidget.selectedItems()]
-        self.selected_properties = [item.text() for item in self.propertiesListWidget.selectedItems()]
+        self.selected_elements = selected_names(self.elementsListWidget)
+        self.selected_compounds = selected_names(self.compoundsListWidget)
+        self.selected_properties = selected_names(self.propertiesListWidget)
         self.selected_metadata = self.metadata_columns + ["id"]
 
         selection = self.tableDropdown.currentText()
+        names = {
+            "Elements": self.selected_elements,
+            "Compounds": self.selected_compounds,
+            "Property": self.selected_properties,
+            "Metadata": self.selected_metadata,
+        }[selection]
         self.columnDropdown.clear()
-        self.columnDropdown.addItems(
-            {
-                "Elements": self.selected_elements,
-                "Compounds": self.selected_compounds,
-                "Property": self.selected_properties,
-                "Metadata": self.selected_metadata,
-            }[selection]
-        )
+        for name in names:
+            self.columnDropdown.addItem(self.column_label(selection, name), name)
 
     def element_list_handler(self):
-        self.selected_elements = [item.text() for item in self.elementsListWidget.selectedItems()]
+        self.selected_elements = selected_names(self.elementsListWidget)
         self.filtered_compounds = filter_compounds_by_elements(self.compounds, self.selected_elements)
-        self.compoundsListWidget.clear()
-        self.compoundsListWidget.addItems(self.filtered_compounds)
+        self.fill_list(self.compoundsListWidget, self.filtered_compounds)
         self.update_columns()
 
     def compound_list_handler(self):
-        self.selected_compounds = [item.text() for item in self.compoundsListWidget.selectedItems()]
+        self.selected_compounds = selected_names(self.compoundsListWidget)
         self.update_columns()
 
     def property_list_handler(self):
-        self.selected_properties = [item.text() for item in self.propertiesListWidget.selectedItems()]
+        self.selected_properties = selected_names(self.propertiesListWidget)
         self.update_columns()
 
     def fetchData(self):
-        self.selected_compounds = [item.text() for item in self.compoundsListWidget.selectedItems()]
+        self.selected_compounds = selected_names(self.compoundsListWidget)
         self.unselected_compounds = [c for c in self.compounds if c not in self.selected_compounds]
 
-        self.selected_properties = [item.text() for item in self.propertiesListWidget.selectedItems()]
+        self.selected_properties = selected_names(self.propertiesListWidget)
         self.unselected_properties = [p for p in self.properties if p not in self.selected_properties]
 
         if self.conn is None:
@@ -533,8 +626,13 @@ class MainWindow(QWidget, Ui_MainWidget):
         # Replace 0 with pd.NA
         self.df.replace(0, nan, inplace=True)
 
-        # Drop columns where all values are NA
-        self.df.dropna(axis=1, how="all", inplace=True)
+        # Drop columns where all values are NA, except constrained ones (shown even when empty)
+        constrained = self.constrained_db_columns()
+        empty = [col for col in self.df.columns if col not in constrained and self.df[col].isna().all()]
+        self.df.drop(columns=empty, inplace=True)
+
+        # constrained columns sit together, just left of the property columns
+        self.df = self.df[order_result_columns(list(self.df.columns), constrained)]
 
         self.df = self.df.fillna("")
 
@@ -550,7 +648,7 @@ class MainWindow(QWidget, Ui_MainWidget):
         # self.df['Composition'] = composition
 
         self.currentPage = 0
-        self.column_names = display_column_names(list(self.df.columns))
+        self.column_names = display_column_names(list(self.df.columns), self.column_label)
 
         self.setColumnTitles(self.column_names)
         self.loadData()
@@ -559,12 +657,19 @@ class MainWindow(QWidget, Ui_MainWidget):
         self.highlightDelegate.updateHighlightedColumns(constrained_columns)
         self.tableView.viewport().update()  # Refresh the view
 
-    def getConstrainedColumns(self):
-        constrained = set()
+    def constrained_db_columns(self) -> List[str]:
+        """Database columns used by the constraints, in constraint order, without repeats."""
+        columns = []
         for row in range(self.constraintsModel.rowCount()):
             table = self.constraintsModel.item(row, 0).text().lower()
             feature = self.constraintsModel.item(row, 1).text()
-            constrained.add("row_id" if feature == "id" else f"{table}_{feature}")
+            column = "row_id" if feature == "id" else f"{table}_{feature}"
+            if column not in columns:
+                columns.append(column)
+        return columns
+
+    def getConstrainedColumns(self):
+        constrained = set(self.constrained_db_columns())
         return {i for i, col in enumerate(self.df.columns) if col in constrained}
 
     # Function placeholders for button actions
@@ -664,18 +769,23 @@ class MainWindow(QWidget, Ui_MainWidget):
         self.properties = columns["property"]
         self.metadata_columns = columns["metadata"]
 
+        info = read_database_info(self.conn)
+        self.units = {key[len("unit:"):]: value for key, value in info.items() if key.startswith("unit:") and value}
+        self.composition_basis = info.get("composition_basis", "")
+        notes = [f"Compositions: {self.composition_basis}" if self.composition_basis else "Composition basis: not recorded in this database"]
+        if not self.units:
+            notes.append("Property units: not recorded in this database")
+        self.compositionLabel.setText(" · ".join(notes))
+
         for widget, line, items in (
             (self.elementsListWidget, self.lineElementSearch, self.elements),
             (self.compoundsListWidget, self.lineCompoundSearch, self.compounds),
             (self.propertiesListWidget, self.linePropertySearch, self.properties),
         ):
-            for w in (widget, line):
-                w.blockSignals(True)
+            line.blockSignals(True)
             line.clear()
-            widget.clear()
-            widget.addItems(items)
-            for w in (widget, line):
-                w.blockSignals(False)
+            line.blockSignals(False)
+            self.fill_list(widget, items)
         self.update_columns()
 
     def choose_database(self):

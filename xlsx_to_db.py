@@ -1,8 +1,11 @@
 """Convert a SciGlass-style spreadsheet into a SciGlass Explorer database.
 
 Usage:
-    python xlsx_to_db.py SciGlass_Plus_properties.xlsx [output.db]
+    python xlsx_to_db.py SciGlass_Plus_properties.xlsx [output.db] --composition-basis "mol %"
         [--sheet NAME] [--first-property T0] [--first-metadata Authors] [--verify-only]
+
+    # only (re)write the unit and composition-basis notes in an existing database:
+    python xlsx_to_db.py --info-only SciGlass_Plus.db --composition-basis "mol %"
 
 Expected spreadsheet layout (one row per glass, header in row 1):
     <ID> | element columns (H, Li, ...) | compound columns (SiO2, ...) | property columns (T0, ...) | metadata columns (Authors, ...)
@@ -18,8 +21,15 @@ Database layout (what main.py queries):
     property(row_id, property_<name>, ...)
     metadata(row_id, metadata_<name>, ...)
 
+    db_info(key, value)   notes shown by the app: "composition_basis" and one "unit:<property>" per property
+
 Column names are kept exactly as in the spreadsheet. Blank cells become NULL. Element, compound
 and property values are stored as REAL numbers; metadata keeps the spreadsheet's own types.
+
+PROPERTY_UNITS below describes the SciGlass Plus spreadsheet. Its temperatures are in K (many values
+end in .15, i.e. converted from deg C), viscosity and resistivity are plain values (not log10), and
+melt/anneal times are in hours (e.g. 0.00277778 h = 10 s). Check it before converting a spreadsheet
+from another source.
 
 After writing, every cell is read back from the database and compared with the spreadsheet; the
 script exits non-zero if anything differs. Use --verify-only to re-check an existing database.
@@ -42,6 +52,84 @@ ELEMENT_SYMBOLS = {
     "Bk", "Cf", "Es", "Fm", "Md", "No", "Lr", "Rf", "Db", "Sg", "Bh", "Hs", "Mt", "Ds", "Rg", "Cn", "Nh", "Fl", "Mc",
     "Lv", "Ts", "Og",
 }
+
+# Units for property columns, matched by exact name first, then by name prefix. Dimensionless
+# properties map to "" (no unit shown).
+PROPERTY_UNITS = {
+    "TresistivityIs1MOhm.m": "K",
+    "TMaxGrowthVelocity": "K",
+    "MaxGrowthVelocity": "m/s",
+    "NucleationTemperature": "K",
+    "NucleationRate": "1/(s·m³)",
+    "ThermalShockRes": "K",
+    "ThermalConductivity": "W/(m·K)",
+    "MeltTemperature": "K",
+    "AnnealTemperature": "K",
+    "MeltTime": "h",
+    "AnnealTime": "h",
+    "AbbeNum": "",
+    "RefractiveIndex": "",
+    "RefractiveIndexLow": "",
+    "RefractiveIndexHigh": "",
+    "MeanDispersion": "",
+    "Permittivity": "",
+    "DielectricConstant (Permittivity)": "",
+    "TangentOfLossAngle": "",
+    "PoissonRatio": "",
+    "YoungModulus": "GPa",
+    "ShearModulus": "GPa",
+    "Microhardness": "GPa",
+    "CrystallizationPeak": "K",
+    "CrystallizationOnset": "K",
+}
+PROPERTY_UNIT_PREFIXES = [  # checked in order
+    ("Viscosity", "Pa·s"),
+    ("Resistivity", "Ω·m"),
+    ("Density", "g/cm³"),
+    ("CTE", "1/K"),
+    ("Cp", "J/(kg·K)"),
+    ("SurfaceTension", "J/m²"),
+    ("T", "K"),  # T0..T12, Tg, Tmelt, Tliquidus, TLittletons, TAnnealing, Tstrain, Tsoft, ...
+]
+
+
+def property_unit(name: str):
+    """The unit for a property column, "" if dimensionless, or None if unknown."""
+    if name in PROPERTY_UNITS:
+        return PROPERTY_UNITS[name]
+    for prefix, unit in PROPERTY_UNIT_PREFIXES:
+        if name.startswith(prefix):
+            return unit
+    return None
+
+
+def write_info(db_path: str, composition_basis: str = None) -> None:
+    """(Re)write the db_info notes: a unit for each property column, and the composition basis if given."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS db_info (key TEXT PRIMARY KEY, value TEXT)")
+        properties = [r[1][len("property_"):] for r in conn.execute("PRAGMA table_info(property)") if r[1].startswith("property_")]
+        unknown = []
+        for name in properties:
+            unit = property_unit(name)
+            if unit is None:
+                unknown.append(name)
+                continue
+            conn.execute("INSERT OR REPLACE INTO db_info VALUES (?, ?)", (f"unit:{name}", unit))
+        if composition_basis:
+            conn.execute("INSERT OR REPLACE INTO db_info VALUES ('composition_basis', ?)", (composition_basis,))
+        conn.commit()
+        basis = conn.execute("SELECT value FROM db_info WHERE key = 'composition_basis'").fetchone()
+    finally:
+        conn.close()
+    print(f"Wrote units for {len(properties) - len(unknown)} of {len(properties)} properties to db_info")
+    if unknown:
+        print(f"  no unit known for: {', '.join(unknown)} (add them to PROPERTY_UNITS)")
+    if basis:
+        print(f"  composition basis: {basis[0]}")
+    else:
+        print("  WARNING: no composition basis recorded; pass --composition-basis (e.g. \"mol %\")")
+
 
 NUMERIC_TABLES = ("elements", "compounds", "property")
 TABLES = NUMERIC_TABLES + ("metadata",)
@@ -221,19 +309,29 @@ def verify(xlsx_path: str, db_path: str, sheet: str, first_property: str, first_
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("xlsx")
+    parser.add_argument("xlsx", help="spreadsheet to convert (with --info-only: the database to update)")
     parser.add_argument("db", nargs="?", help="output database (default: next to the spreadsheet, same name, .db)")
+    parser.add_argument("--composition-basis", help='what composition values mean, shown in the app, e.g. "mol %%"')
+    parser.add_argument("--info-only", action="store_true", help="only write unit and composition-basis notes into an existing database")
     parser.add_argument("--sheet", help="worksheet name (default: first sheet)")
     parser.add_argument("--first-property", default="T0")
     parser.add_argument("--first-metadata", default="Authors")
     parser.add_argument("--verify-only", action="store_true", help="only compare an existing database with the spreadsheet")
     args = parser.parse_args(argv)
 
+    if args.info_only:
+        if not os.path.isfile(args.xlsx):
+            print(f"Error: database not found: {args.xlsx}", file=sys.stderr)
+            return 2
+        write_info(args.xlsx, args.composition_basis)
+        return 0
+
     db = args.db or os.path.splitext(args.xlsx)[0] + ".db"
     opts = (args.sheet, args.first_property, args.first_metadata)
     try:
         if not args.verify_only:
             convert(args.xlsx, db, *opts)
+            write_info(db, args.composition_basis)
         return 0 if verify(args.xlsx, db, *opts) else 1
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)

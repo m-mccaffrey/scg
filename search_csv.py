@@ -14,11 +14,16 @@ produced it, followed by the results themselves:
     SiO2
     [Selected Properties]
     T0
+    [Database]
+    File,SciGlass_Plus.db
+    Compositions,mol %
     [Results]
     <result header row>
     <result rows...>
 
-Every line is valid CSV, so the file still opens cleanly in Excel.
+Every line is valid CSV, so the file still opens cleanly in Excel. The [Database] section is
+informational and is ignored on import. Files are written as UTF-8 with a byte-order mark so Excel
+shows units and accented names correctly.
 """
 
 import csv
@@ -36,6 +41,7 @@ SECTION_CONSTRAINTS = "[Constraints]"
 SECTION_ELEMENTS = "[Selected Elements]"
 SECTION_COMPOUNDS = "[Selected Compounds]"
 SECTION_PROPERTIES = "[Selected Properties]"
+SECTION_DATABASE = "[Database]"
 SECTION_RESULTS = "[Results]"
 
 
@@ -51,8 +57,8 @@ class SearchCsvError(ValueError):
     pass
 
 
-def write_search_csv(path: str, spec: SearchSpec, results: pd.DataFrame = None) -> None:
-    with open(path, "w", newline="", encoding="utf-8") as f:
+def write_search_csv(path: str, spec: SearchSpec, results: pd.DataFrame = None, database: dict = None) -> None:
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow([MAGIC, f"format={FORMAT_VERSION}"])
 
@@ -70,6 +76,11 @@ def write_search_csv(path: str, spec: SearchSpec, results: pd.DataFrame = None) 
         ):
             writer.writerow([section])
             writer.writerow(items)
+
+        if database:
+            writer.writerow([SECTION_DATABASE])
+            for key, value in database.items():
+                writer.writerow([key, value])
 
         writer.writerow([SECTION_RESULTS])
         if results is not None:
