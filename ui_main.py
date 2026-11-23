@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 
 ################################################################################
-## Form generated from reading UI file 'mainUsBmlI.ui'
+## Form generated from reading UI file 'main.ui'
 ##
-## Created by: Qt User Interface Compiler version 6.4.3
+## Created by: Qt User Interface Compiler version 6.12.0
 ##
 ## WARNING! All changes made in this file will be lost when recompiling UI file!
 ################################################################################
@@ -36,7 +36,7 @@ class Ui_MainWidget(object):
         self.gridLayout_2.setContentsMargins(10, 0, 10, -1)
         self.elementsListWidget = QListWidget(MainWidget)
         self.elementsListWidget.setObjectName(u"elementsListWidget")
-        sizePolicy = QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        sizePolicy = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         sizePolicy.setHorizontalStretch(1)
         sizePolicy.setVerticalStretch(0)
         sizePolicy.setHeightForWidth(self.elementsListWidget.sizePolicy().hasHeightForWidth())
@@ -135,7 +135,7 @@ class Ui_MainWidget(object):
         self.columnDropdown = QComboBox(MainWidget)
         self.columnDropdown.addItem("")
         self.columnDropdown.setObjectName(u"columnDropdown")
-        sizePolicy1 = QSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        sizePolicy1 = QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         sizePolicy1.setHorizontalStretch(0)
         sizePolicy1.setVerticalStretch(0)
         sizePolicy1.setHeightForWidth(self.columnDropdown.sizePolicy().hasHeightForWidth())
@@ -176,7 +176,7 @@ class Ui_MainWidget(object):
 
         self.constraintsListWidget = QTableView(MainWidget)
         self.constraintsListWidget.setObjectName(u"constraintsListWidget")
-        sizePolicy2 = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        sizePolicy2 = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         sizePolicy2.setHorizontalStretch(0)
         sizePolicy2.setVerticalStretch(0)
         sizePolicy2.setHeightForWidth(self.constraintsListWidget.sizePolicy().hasHeightForWidth())
@@ -209,7 +209,7 @@ class Ui_MainWidget(object):
 
         self.bottom_layout.addWidget(self.pageLabel, 1, 5, 1, 1)
 
-        self.horizontalSpacer = QSpacerItem(40, 20, QSizePolicy.Expanding, QSizePolicy.Minimum)
+        self.horizontalSpacer = QSpacerItem(40, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
 
         self.bottom_layout.addItem(self.horizontalSpacer, 1, 0, 1, 1)
 
@@ -243,8 +243,25 @@ class Ui_MainWidget(object):
 
         self.bottom_layout.addWidget(self.totalResultsLabel, 1, 4, 1, 1)
 
+        self.dbLabel = QLabel(MainWidget)
+        self.dbLabel.setObjectName(u"dbLabel")
+        self.dbLabel.setAlignment(Qt.AlignRight|Qt.AlignVCenter)
+
+        self.bottom_layout.addWidget(self.dbLabel, 2, 0, 1, 1)
+
+        self.chooseDbButton = QPushButton(MainWidget)
+        self.chooseDbButton.setObjectName(u"chooseDbButton")
+
+        self.bottom_layout.addWidget(self.chooseDbButton, 2, 1, 1, 1)
+
 
         self.layout.addLayout(self.bottom_layout)
+
+        self.compositionLabel = QLabel(MainWidget)
+        self.compositionLabel.setObjectName(u"compositionLabel")
+        self.compositionLabel.setWordWrap(True)
+
+        self.layout.addWidget(self.compositionLabel)
 
 
         self.retranslateUi(MainWidget)
@@ -281,5 +298,10 @@ class Ui_MainWidget(object):
         self.prevPageButton.setText(QCoreApplication.translate("MainWidget", u"Previous Page", None))
         self.nextPageButton.setText(QCoreApplication.translate("MainWidget", u"Next Page", None))
         self.load_button.setText(QCoreApplication.translate("MainWidget", u"Fetch Data", None))
+        self.dbLabel.setText(QCoreApplication.translate("MainWidget", u"Database: (none)", None))
+        self.chooseDbButton.setText(QCoreApplication.translate("MainWidget", u"Choose Database...", None))
+#if QT_CONFIG(tooltip)
+        self.compositionLabel.setToolTip(QCoreApplication.translate("MainWidget", u"What the composition values in this database mean", None))
+#endif // QT_CONFIG(tooltip)
     # retranslateUi
 

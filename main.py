@@ -234,11 +234,7 @@ class MainWindow(QWidget, Ui_MainWidget):
         # Connect to SQLite database
         self.conn = None
         self.db_path = None
-        self.dbLabel = QLabel(self)
-        self.chooseDbButton = QPushButton("Choose Database...", self)
         self.chooseDbButton.clicked.connect(self.choose_database)
-        self.bottom_layout.addWidget(self.dbLabel, 2, 0, 1, 1, Qt.AlignRight | Qt.AlignVCenter)
-        self.bottom_layout.addWidget(self.chooseDbButton, 2, 1, 1, 1)
         # Set the window icon
         self.setWindowTitle(f"{manifest.APP_TITLE} Version {manifest.APP_VERSION} (Build {manifest.APP_BUILD})")
 
@@ -251,11 +247,6 @@ class MainWindow(QWidget, Ui_MainWidget):
         self.composition_basis = ""
         # whether a 0 in a property/metadata column means "no data" (compositions: 0 always means absent)
         self.zero_is_missing = True
-
-        # note under the results saying what the composition numbers mean
-        self.compositionLabel = QLabel(self)
-        self.compositionLabel.setWordWrap(True)
-        self.layout.addWidget(self.compositionLabel)
 
         def setup_list_widget(
             widget: QListWidget, get_items: Callable[[], List[str]], handler: Callable, btn_all: QPushButton, btn_none: QPushButton, line_search: QLineEdit
