@@ -89,6 +89,9 @@ def open_database(path: str) -> sqlite3.Connection:
     return conn
 
 
+# Most glasses a search loads (the total is still counted); large databases would otherwise run out of memory
+MAX_RESULTS = 50_000
+
 # The four tables, joined on row_id
 JOIN_CLAUSE = """
     compounds
@@ -384,9 +387,17 @@ class MainWindow(QWidget, Ui_MainWidget):
         spec = getattr(self, "last_search_spec", None) or self.current_search_spec()
         try:
             database = {"File": os.path.basename(self.db_path or ""), "Compositions": self.composition_basis or "not recorded"}
+            total = getattr(self, "total_matches", len(df_copy))
+            if total > len(df_copy):
+                database["Rows"] = f"first {len(df_copy)} of {total} matches"
             write_search_csv(filename, spec, df_copy, database)
         except OSError as e:
             QMessageBox.critical(self, "Export to CSV", f"Could not write {filename}:\n{e}")
+            return
+        if total > len(df_copy):
+            QMessageBox.information(
+                self, "Export to CSV", f"Exported the first {len(df_copy):,} of {total:,} matching glasses. Narrow the search to export the rest."
+            )
 
     def import_from_csv(self):
         filename, _ = QFileDialog.getOpenFileName(self, "Import Search From CSV", "", "CSV Files (*.csv);;All Files (*)")
@@ -503,6 +514,8 @@ class MainWindow(QWidget, Ui_MainWidget):
             + (f" WHERE {where_clause}" if where_clause else "")
             + " ORDER BY compounds.rowid"
         )
+        self.total_matches = cur.execute("SELECT count(*) FROM temp.matches").fetchone()[0]
+        cur.execute("DELETE FROM temp.matches WHERE n > ?", (MAX_RESULTS,))
         cur.execute("CREATE INDEX temp.matches_row_id ON matches (row_id)")
 
         constrained = set(self.constrained_db_columns())
@@ -653,7 +666,12 @@ class MainWindow(QWidget, Ui_MainWidget):
         self.last_search_spec = self.current_search_spec()
 
         # Get the total number of results
-        self.totalResultsLabel.setText(f"Total Results: {len(query_results)}")
+        if self.total_matches > len(query_results):
+            self.totalResultsLabel.setText(
+                f"Total Results: {self.total_matches:,} (showing the first {len(query_results):,}; narrow the search to see the rest)"
+            )
+        else:
+            self.totalResultsLabel.setText(f"Total Results: {len(query_results)}")
 
         # Create the DataFrame
         self.df = pd.DataFrame(query_results, columns=column_names)
